@@ -1,0 +1,85 @@
+#!/bin/bash
+
+# Configuración inicial
+AWS_REGION="us-east-1"
+INSTANCE_TYPE="t3.large"        # 2 vCPU y 8 GiB RAM
+INSTANCE_NAME="MyUbuntuVM"
+DISK_SIZE="500"                 # 500 GB
+KEY_NAME="aws-ssh-key"
+SECURITY_GROUP_NAME="vm-security-group"
+AMI_NAME="ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+
+# 1. Obtener AMI más reciente de Ubuntu 22.04
+AMI_ID=$(aws ec2 describe-images \
+    --region $AWS_REGION \
+    --owners 099720109477 \
+    --filters "Name=name,Values=$AMI_NAME" "Name=virtualization-type,Values=hvm" \
+    --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+    --output text)
+
+# 2. Crear par de claves SSH (si no existe)
+if [ ! -f ~/.ssh/$KEY_NAME.pem ]; then
+    aws ec2 create-key-pair \
+        --region $AWS_REGION \
+        --key-name $KEY_NAME \
+        --query 'KeyMaterial' \
+        --output text > ~/.ssh/$KEY_NAME.pem
+    chmod 400 ~/.ssh/$KEY_NAME.pem
+fi
+
+# 3. Crear Security Group con reglas SSH
+SG_ID=$(aws ec2 create-security-group \
+    --region $AWS_REGION \
+    --group-name $SECURITY_GROUP_NAME \
+    --description "Security Group for SSH access" \
+    --output text)
+
+aws ec2 authorize-security-group-ingress \
+    --region $AWS_REGION \
+    --group-id $SG_ID \
+    --protocol tcp \
+    --port 22 \
+    --cidr 0.0.0.0/0
+
+# 4. Crear instancia EC2
+INSTANCE_ID=$(aws ec2 run-instances \
+    --region $AWS_REGION \
+    --image-id $AMI_ID \
+    --instance-type $INSTANCE_TYPE \
+    --key-name $KEY_NAME \
+    --security-group-ids $SG_ID \
+    --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$DISK_SIZE,\"VolumeType\":\"gp3\"}}]" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
+    --query 'Instances[0].InstanceId' \
+    --output text)
+
+# 5. Esperar a que la instancia esté en ejecución
+aws ec2 wait instance-running \
+    --region $AWS_REGION \
+    --instance-ids $INSTANCE_ID
+
+# 6. Obtener IP pública
+PUBLIC_IP=$(aws ec2 describe-instances \
+    --region $AWS_REGION \
+    --instance-ids $INSTANCE_ID \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' \
+    --output text)
+
+# 7. Configurar alertas de CloudWatch
+# Alerta de CPU (>80% por 5 minutos)
+aws cloudwatch put-metric-alarm \
+    --region $AWS_REGION \
+    --alarm-name "HighCPUUtilization-$INSTANCE_ID" \
+    --alarm-description "Alerta cuando uso de CPU supera 80%" \
+    --metric-name CPUUtilization \
+    --namespace AWS/EC2 \
+    --statistic Average \
+    --period 300 \
+    --threshold 80 \
+    --comparison-operator GreaterThanThreshold \
+    --dimensions "Name=InstanceId,Value=$INSTANCE_ID" \
+    --evaluation-periods 1 \
+    --alarm-actions arn:aws:sns:us-east-1:TU_ACCOUNT_ID:MyAlertTopic  # Reemplazar con tu ARN de SNS
+
+echo "Instancia EC2 creada exitosamente!"
+echo "Acceso SSH: ssh -i ~/.ssh/$KEY_NAME.pem ubuntu@$PUBLIC_IP"
