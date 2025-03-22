@@ -1,0 +1,107 @@
+#!/bin/bash
+
+# Configuración inicial
+RESOURCE_GROUP="MiGrupoRecursos"
+VM_NAME="mi-vm-ubuntu"
+LOCATION="eastus"
+VM_SIZE="Standard_D2s_v3"  # 2 vCPUs y 8 GB RAM
+DISK_SIZE="500"            # 500 GB
+OS_IMAGE="Canonical:UbuntuServer:22_04-lts:latest"
+ADMIN_USERNAME="azureuser"
+NSG_NAME="mi-nsg"
+SSH_KEY_PATH="~/.ssh/azure-vm-key"
+
+# 1. Crear grupo de recursos
+az group create --name $RESOURCE_GROUP --location $LOCATION
+
+# 2. Crear red virtual y subnet
+az network vnet create \
+    --resource-group $RESOURCE_GROUP \
+    --name MiVnet \
+    --address-prefix 10.0.0.0/16 \
+    --subnet-name MiSubnet \
+    --subnet-prefix 10.0.1.0/24
+
+# 3. Crear IP pública
+az network public-ip create \
+    --resource-group $RESOURCE_GROUP \
+    --name MiIPPublica \
+    --sku Standard \
+    --allocation-method Static
+
+# 4. Crear NSG y regla SSH
+az network nsg create \
+    --resource-group $RESOURCE_GROUP \
+    --name $NSG_NAME
+
+az network nsg rule create \
+    --resource-group $RESOURCE_GROUP \
+    --nsg-name $NSG_NAME \
+    --name PermitirSSH \
+    --priority 100 \
+    --protocol Tcp \
+    --destination-port-ranges 22 \
+    --access Allow
+
+# 5. Crear interfaz de red
+az network nic create \
+    --resource-group $RESOURCE_GROUP \
+    --name MiNIC \
+    --vnet-name MiVnet \
+    --subnet MiSubnet \
+    --network-security-group $NSG_NAME \
+    --public-ip-address MiIPPublica
+
+# 6. Generar clave SSH (si no existe)
+if [ ! -f $SSH_KEY_PATH ]; then
+    ssh-keygen -t rsa -b 4096 -C "azure-vm-key" -f $SSH_KEY_PATH -N ""
+fi
+
+# 7. Crear la VM
+az vm create \
+    --resource-group $RESOURCE_GROUP \
+    --name $VM_NAME \
+    --location $LOCATION \
+    --size $VM_SIZE \
+    --image $OS_IMAGE \
+    --admin-username $ADMIN_USERNAME \
+    --os-disk-size-gb $DISK_SIZE \
+    --nics MiNIC \
+    --ssh-key-values $SSH_KEY_PATH.pub \
+    --public-ip-sku Standard
+
+# 8. Configurar alertas (CPU y Memoria)
+ACTION_GROUP_NAME="AlertasVM"
+EMAIL="tu-email@dominio.com"
+
+# Crear grupo de acción para notificaciones
+az monitor action-group create \
+    --name $ACTION_GROUP_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --action email admin $EMAIL
+
+# Crear alerta de CPU (>80% por 5 min)
+az monitor metrics alert create \
+    --name "AltoUsoCPU" \
+    --resource-group $RESOURCE_GROUP \
+    --scopes $(az vm show -g $RESOURCE_GROUP -n $VM_NAME --query id -o tsv) \
+    --condition "avg Percentage CPU > 80" \
+    --window-size 5m \
+    --evaluation-frequency 1m \
+    --action $ACTION_GROUP_NAME
+
+# Crear alerta de Memoria (<2GB disponibles)
+az monitor metrics alert create \
+    --name "BajaMemoria" \
+    --resource-group $RESOURCE_GROUP \
+    --scopes $(az vm show -g $RESOURCE_GROUP -n $VM_NAME --query id -o tsv) \
+    --condition "max Available Memory Bytes < 2147483648" \  # 2 GB
+    --window-size 5m \
+    --evaluation-frequency 1m \
+    --action $ACTION_GROUP_NAME
+
+echo "VM creada exitosamente!"
+echo "Acceso SSH: ssh -i $SSH_KEY_PATH $ADMIN_USERNAME@$(az vm show --show-details --resource-group $RESOURCE_GROUP --name $VM_NAME --query publicIps --output tsv)"
+
+chmod +x create-azure-vm.sh
+./create-azure-vm.sh

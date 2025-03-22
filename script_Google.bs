@@ -1,0 +1,86 @@
+gcloud services enable compute.googleapis.com monitoring.googleapis.com
+
+#!/bin/bash
+
+# Configuración inicial
+PROJECT_ID="tu-project-id"
+INSTANCE_NAME="mi-vm-ubuntu"
+ZONE="us-central1-a"
+MACHINE_TYPE="n2-standard-2"        # 2 vCPUs y 8GB RAM
+DISK_SIZE="500"                     # 500 GB
+OS_IMAGE="ubuntu-2204-jammy-v20240611"  # Ubuntu 22.04 LTS
+NETWORK_TAG="allow-ssh-http"
+
+# 1. Crear la instancia con IP pública
+gcloud compute instances create $INSTANCE_NAME \
+    --project=$PROJECT_ID \
+    --zone=$ZONE \
+    --machine-type=$MACHINE_TYPE \
+    --tags=$NETWORK_TAG \
+    --image=$OS_IMAGE \
+    --image-project=ubuntu-os-cloud \
+    --boot-disk-size=$DISK_SIZE \
+    --boot-disk-type=pd-ssd \
+    --metadata=enable-oslogin=true \
+    --network-tier=STANDARD \
+    --no-restart-on-failure
+
+# 2. Generar clave SSH (si no existe)
+if [ ! -f ~/.ssh/gcp-vm-key ]; then
+    ssh-keygen -t rsa -b 4096 -C "gcp-vm-user" -f ~/.ssh/gcp-vm-key -N ""
+fi
+
+# 3. Agregar clave SSH a los metadatos del proyecto
+gcloud compute os-login ssh-keys add \
+    --key-file=~/.ssh/gcp-vm-key.pub \
+    --project=$PROJECT_ID
+
+# 4. Configurar regla de firewall para SSH
+gcloud compute firewall-rules create allow-ssh \
+    --project=$PROJECT_ID \
+    --allow=tcp:22 \
+    --direction=INGRESS \
+    --target-tags=$NETWORK_TAG \
+    --priority=1000
+
+# 5. Configurar alertas de monitorización
+ALERT_POLICY_NAME="vm-alertas"
+
+# Crear política de alertas (CPU > 80% por 5 min)
+gcloud alpha monitoring policies create \
+    --policy-from-file="alert-policy.json" \
+    --project=$PROJECT_ID
+
+# Crear archivo JSON para política de alertas (CPU, Memoria, Disco)
+cat > alert-policy.json <<EOF
+{
+  "displayName": "$ALERT_POLICY_NAME",
+  "conditions": [
+    {
+      "displayName": "High CPU Usage",
+      "conditionThreshold": {
+        "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/cpu/utilization\"",
+        "aggregations": [{"alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN"}],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0.8,
+        "duration": "300s"
+      }
+    },
+    {
+      "displayName": "High Memory Usage",
+      "conditionThreshold": {
+        "filter": "resource.type=\"gce_instance\" AND metric.type=\"agent.googleapis.com/memory/percent_used\"",
+        "aggregations": [{"alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN"}],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0.8,
+        "duration": "300s"
+      }
+    }
+  ],
+  "combiner": "OR",
+  "notificationChannels": ["projects/$PROJECT_ID/notificationChannels/ID_CANAL"]
+}
+EOF
+
+echo "VM creada exitosamente!"
+echo "Acceso SSH: ssh -i ~/.ssh/gcp-vm-key tu-usuario@$(gcloud compute instances describe $INSTANCE_NAME --format='get(networkInterfaces[0].accessConfigs[0].natIP)')"
